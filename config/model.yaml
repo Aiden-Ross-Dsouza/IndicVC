@@ -1,0 +1,108 @@
+# IndicVC Model Configuration
+# ============================
+# Edit this file to switch backends, languages, and hyperparameters.
+# All module constructors read from this file via build_* factory functions.
+
+model:
+  name: IndicVC
+  version: "0.1.0"
+  sample_rate: 16000          # All audio resampled to 16kHz internally
+  output_dim: 1024            # Shared feature dim across all modules → DiT
+
+# ------------------------------------------------------------------
+# Content Encoder
+# ------------------------------------------------------------------
+content_encoder:
+  # Backend options:
+  #   "indicwhisper"   — per-language Whisper, causal-adapted (lighter)
+  #   "indicconformer" — single 600M multilingual Conformer (richer features)
+  # Ablation tip: train two runs, one per backend, and compare WER.
+  backend: indicwhisper
+
+  chunk_size_ms: 200      # Streaming chunk duration. 200ms = good latency/quality tradeoff
+  lookahead_ms: 40        # Future context per chunk. 0 = strict causal.
+  output_dim: 1024        # Must match model.output_dim
+  freeze_encoder: false   # Set true to freeze during initial speaker-encoder training
+  dropout: 0.1
+  cache_encoders: true    # Keep loaded encoders in memory (saves reload time)
+
+  # Languages to support. Add/remove as needed.
+  # All must have IndicWhisper checkpoints or fall back to whisper-small.
+  languages:
+    - hi    # Hindi        (Indo-Aryan)
+    - ta    # Tamil        (Dravidian)
+    - te    # Telugu       (Dravidian)
+    - kn    # Kannada      (Dravidian)
+    - ml    # Malayalam    (Dravidian)
+    - bn    # Bengali      (Indo-Aryan)
+    - mr    # Marathi      (Indo-Aryan)
+    - gu    # Gujarati     (Indo-Aryan)
+    - or    # Odia         (Indo-Aryan)
+    - pa    # Punjabi      (Indo-Aryan)
+
+# ------------------------------------------------------------------
+# Speaker Encoder  (defined in modules/speaker_encoder.py)
+# ------------------------------------------------------------------
+speaker_encoder:
+  model: ecapa_tdnn           # Architecture
+  pretrained: true            # Start from English ECAPA-TDNN checkpoint
+  checkpoint: null            # Path to Indic-fine-tuned checkpoint (set after training)
+  embedding_dim: 192          # Standard ECAPA-TDNN output dim
+  freeze: false
+
+# ------------------------------------------------------------------
+# Emotion Encoder  (defined in modules/emotion_encoder.py)
+# ------------------------------------------------------------------
+emotion_encoder:
+  model: emotion2vec           # emotion2vec base checkpoint
+  checkpoint: null             # Path to Rasa-fine-tuned checkpoint
+  embedding_dim: 256
+  n_emotions: 12               # Matches Rasa: Anger, Happy, Sad, Neutral, etc.
+  freeze: false
+
+# ------------------------------------------------------------------
+# Language Family MoE Router  (defined in modules/moe_router.py)
+# ------------------------------------------------------------------
+moe_router:
+  n_experts: 2                 # Expert 0: Indo-Aryan, Expert 1: Dravidian
+  expert_dim: 1024
+  router_input: lang_id        # "lang_id" | "content_features" | "both"
+  load_balance_weight: 0.01    # Auxiliary load balancing loss weight
+
+# ------------------------------------------------------------------
+# DiT Decoder  (defined in modules/dit_decoder.py)
+# ------------------------------------------------------------------
+dit_decoder:
+  n_layers: 13
+  n_heads: 8
+  embedding_dim: 512
+  ffn_dim: 2048
+  dropout: 0.1
+  use_moe: true               # Insert MoE into FFN layers
+  moe_every_n_layers: 2       # Insert MoE every N layers (not every layer)
+
+# ------------------------------------------------------------------
+# Vocoder
+# ------------------------------------------------------------------
+vocoder:
+  model: bigvgan               # Language-agnostic, keep pretrained weights
+  checkpoint: null             # Fine-tune on IndicVoices-R after other modules converge
+  freeze: false
+
+# ------------------------------------------------------------------
+# Training
+# ------------------------------------------------------------------
+training:
+  batch_size: 16
+  grad_accum_steps: 4          # Effective batch = 64 (matches Seed-VC)
+  max_steps: 400000
+  warmup_steps: 5000
+  peak_lr: 1.0e-4
+  min_lr: 1.0e-5
+  lr_scheduler: exponential
+  optimizer: adamw
+  clip_grad_norm: 1.0
+  fp16: true                   # Essential for Quadro 6000 memory
+
+  # Phased training schedule (see README for rationale)
+  phase: 1                     # 1=speaker_encoder, 2=content_encoder, 3=joint
