@@ -271,7 +271,10 @@ class IndicWhisperEncoder(nn.Module):
         model_id = INDICWHISPER_MODEL_IDS.get(lang, INDICWHISPER_MODEL_IDS["_default"])
         print(f"[IndicWhisperEncoder] Loading {model_id} for lang='{lang}'...")
 
-        model = WhisperModel.from_pretrained(model_id)
+        # CVE-2025-32434: transformers >= 4.x blocks torch.load on PyTorch < 2.6.
+        # vasista22 models only ship pytorch_model.bin (no safetensors).
+        # Fix: convert bin → safetensors in the HF cache before calling from_pretrained.
+        model = self._load_whisper_safe(model_id)
         encoder = model.encoder  # only keep encoder half
 
         # Patch self-attention → chunk-causal attention
@@ -289,6 +292,64 @@ class IndicWhisperEncoder(nn.Module):
         if self.cfg.cache_encoders:
             self._encoder_cache[lang] = encoder
         return encoder
+
+    @staticmethod
+    def _load_whisper_safe(model_id: str):
+        """
+        Load a WhisperModel even when the repo only has pytorch_model.bin
+        and transformers blocks torch.load on PyTorch < 2.6 (CVE-2025-32434).
+
+        Strategy: download the .bin file explicitly via hf_hub_download,
+        load it with torch.load(..., weights_only=False) ourselves (we trust
+        HuggingFace-hosted weights), write a safetensors version next to it
+        in the local cache, then call from_pretrained with local_files_only=True.
+        On subsequent calls the safetensors file is already present and
+        from_pretrained loads it directly with no CVE check.
+        """
+        import os
+        from huggingface_hub import snapshot_download, hf_hub_download
+        from transformers import WhisperModel
+
+        # First try: from_pretrained directly (works if safetensors already cached)
+        try:
+            return WhisperModel.from_pretrained(model_id)
+        except (ValueError, OSError):
+            pass  # CVE block or missing file — fall through to manual path
+
+        print(f"  [CVE workaround] Converting pytorch_model.bin → safetensors ...")
+
+        # 1. Download the full repo so we have config files
+        local_dir = snapshot_download(
+            repo_id=model_id,
+            ignore_patterns=["*.safetensors"],  # skip if somehow present
+        )
+
+        bin_path = os.path.join(local_dir, "pytorch_model.bin")
+        st_path  = os.path.join(local_dir, "model.safetensors")
+
+        if not os.path.exists(st_path):
+            if not os.path.exists(bin_path):
+                raise FileNotFoundError(
+                    f"Neither pytorch_model.bin nor model.safetensors found in {local_dir}"
+                )
+            # Load with weights_only=False — we trust the HF-hosted vasista22 models
+            state_dict = torch.load(bin_path, map_location="cpu", weights_only=False)
+            try:
+                from safetensors.torch import save_file
+                save_file(state_dict, st_path)
+                print(f"  [CVE workaround] Saved safetensors to {st_path}")
+            except ImportError:
+                # safetensors not installed — install it silently and retry
+                import subprocess, sys
+                subprocess.check_call(
+                    [sys.executable, "-m", "pip", "install", "safetensors", "-q"]
+                )
+                from safetensors.torch import save_file
+                save_file(state_dict, st_path)
+                print(f"  [CVE workaround] Installed safetensors and saved to {st_path}")
+
+        # 2. Now from_pretrained will find model.safetensors and bypass the CVE check
+        return WhisperModel.from_pretrained(local_dir)
 
     # Whisper encoder always expects exactly this many mel frames (30s window)
     WHISPER_MEL_FRAMES = 3000

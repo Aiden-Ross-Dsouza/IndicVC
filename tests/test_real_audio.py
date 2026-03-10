@@ -120,7 +120,7 @@ def _lang_to_name(lang: str) -> str:
 
 
 def run_test(backend: str, wav: torch.Tensor, lang: str,
-             audio_path: str, duration_s: float):
+             audio_path: str, duration_s: float, device: str = "cpu"):
     print(f"\n{'─'*60}")
     print(f"  Backend  : {backend}")
     print(f"  Language : {lang}")
@@ -140,6 +140,8 @@ def run_test(backend: str, wav: torch.Tensor, lang: str,
     print("\n[1/3] Loading encoder...")
     t0 = time.time()
     enc = ContentEncoder(cfg)
+    enc = enc.to(device)
+    wav = wav.to(device)
     load_time = time.time() - t0
     print(f"      Load time: {load_time:.1f}s")
 
@@ -216,6 +218,8 @@ def main():
     parser.add_argument("--backend", default="both",
                         choices=["indicwhisper", "indicconformer", "both"])
     parser.add_argument("--lang", default="hi")
+    parser.add_argument("--device", default="cpu",
+                        help="Device to run on: cpu or cuda")
     args = parser.parse_args()
 
     print(f"\nIndicVC — Real Audio Content Encoder Test")
@@ -250,7 +254,8 @@ def main():
     all_features = {}
     for backend in backends:
         try:
-            feat = run_test(backend, wav, args.lang, audio_path, duration_s)
+            feat = run_test(backend, wav, args.lang, audio_path, duration_s,
+                            device=args.device)
             results[backend] = True
             all_features[backend] = feat
         except Exception as e:

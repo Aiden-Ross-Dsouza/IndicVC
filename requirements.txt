@@ -5,6 +5,7 @@ soundfile
 
 # Indic conformer
 onnxruntime
+huggingface_hub
 
 # Speaker encoder
 # speechbrain

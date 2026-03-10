@@ -6,3 +6,5 @@ test2.wav
 output.wav
 torch.Tensor
 SpeakerEncoder
+data.py
+data/
