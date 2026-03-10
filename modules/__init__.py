@@ -19,10 +19,19 @@ from .content_encoder import (
     LANG_FAMILY,
 )
 
+from .speaker_encoder import (
+    SpeakerEncoder,
+    SpeakerEncoderConfig,
+    build_speaker_encoder,
+)
+
 __all__ = [
     "ContentEncoder",
     "ContentEncoderConfig",
     "build_content_encoder",
     "INDIC_LANG_CODES",
     "LANG_FAMILY",
+    "SpeakerEncoder",
+    "SpeakerEncoderConfig",
+    "build_speaker_encoder",
 ]

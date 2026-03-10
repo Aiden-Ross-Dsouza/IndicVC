@@ -1,6 +1,10 @@
 transformers
 torch
 torchaudio
+soundfile
 
 # Indic conformer
 onnxruntime
+
+# Speaker encoder
+# speechbrain

@@ -44,11 +44,13 @@ content_encoder:
 # Speaker Encoder  (defined in modules/speaker_encoder.py)
 # ------------------------------------------------------------------
 speaker_encoder:
-  model: ecapa_tdnn           # Architecture
-  pretrained: true            # Start from English ECAPA-TDNN checkpoint
-  checkpoint: null            # Path to Indic-fine-tuned checkpoint (set after training)
+  pretrained_model: "speechbrain/spkrec-ecapa-voxceleb"  # ~80MB, VoxCeleb2 pretrained
   embedding_dim: 192          # Standard ECAPA-TDNN output dim
-  freeze: false
+  n_speakers: 1000            # Update to actual IndicVoices-R speaker count after EDA
+  aam_margin: 0.2             # AAM-Softmax angular margin
+  aam_scale: 30.0             # AAM-Softmax logit scale
+  freeze_backbone: false      # Set true for Phase 2 warmup, false for full fine-tune
+  min_duration_s: 1.0         # Pad shorter utterances to this length
 
 # ------------------------------------------------------------------
 # Emotion Encoder  (defined in modules/emotion_encoder.py)
