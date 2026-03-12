@@ -7,3 +7,9 @@ torch.Tensor
 SpeakerEncoder
 data.py
 data/
+checkpoints/
+training/__pycache__/
+wandb/
+eval_output/
+data_full/
+data_test/

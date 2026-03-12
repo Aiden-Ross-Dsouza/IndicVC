@@ -2,6 +2,7 @@ transformers
 torch
 torchaudio
 soundfile
+wandb
 
 # Indic conformer
 onnxruntime
@@ -9,3 +10,6 @@ huggingface_hub
 
 # Speaker encoder
 # speechbrain
+
+# Download data
+datasets==2.21.0
