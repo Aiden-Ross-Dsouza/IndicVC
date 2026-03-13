@@ -163,7 +163,8 @@ def compute_eer(scores, targets):
 def load_model(ckpt_path, device):
     ckpt = torch.load(ckpt_path, map_location="cpu", weights_only=False)
     state = ckpt["model"] if "model" in ckpt else ckpt
-    n_spk = (ckpt.get("config") or {}).get("n_speakers", 3589) or 3589
+    # Try top-level n_speakers first (v2+ checkpoints), fall back to config
+    n_spk = ckpt.get("n_speakers") or (ckpt.get("config") or {}).get("n_speakers", 1938) or 1938
     cfg = SpeakerEncoderConfig(pretrained_model="", embedding_dim=192, n_speakers=n_spk)
     model = SpeakerEncoder(cfg)
     missing, _ = model.load_state_dict(state, strict=False)
@@ -173,13 +174,29 @@ def load_model(ckpt_path, device):
     return model.to(device)
 
 
-def run_evaluation(ckpt_path, rows, device, label="", out_dir=Path("eval_output"), save_plots=True):
+def load_pretrained_baseline(device):
+    """Load raw VoxCeleb2 pretrained ECAPA-TDNN with NO fine-tuning.
+    This is the key baseline — if our fine-tuned model is not clearly better
+    than this, our training has not helped.
+    """
+    print("  Loading pretrained baseline (speechbrain/spkrec-ecapa-voxceleb)...")
+    cfg = SpeakerEncoderConfig(
+        pretrained_model="speechbrain/spkrec-ecapa-voxceleb",
+        embedding_dim=192, n_speakers=0,
+    )
+    return SpeakerEncoder(cfg).to(device)
+
+
+def run_evaluation(ckpt_path, rows, device, label="", out_dir=Path("eval_output"),
+                   save_plots=True, model=None):
+    name = Path(ckpt_path).name if ckpt_path else label
     print(f"\n{'='*60}")
-    print(f"  {Path(ckpt_path).name}  {label}")
+    print(f"  {name}  {label}")
     print(f"  Utterances: {len(rows)}  |  Speakers: {len(set(r['speaker_id'] for r in rows))}")
     print(f"{'='*60}")
 
-    model = load_model(ckpt_path, device)
+    if model is None:
+        model = load_model(ckpt_path, device)
     emb_t, spk_ids, lang_ids = extract_embeddings(model, rows, device)
     emb = F.normalize(emb_t, dim=-1).numpy()
 
@@ -229,7 +246,7 @@ def run_evaluation(ckpt_path, rows, device, label="", out_dir=Path("eval_output"
             import matplotlib; matplotlib.use("Agg")
             import matplotlib.pyplot as plt
             out_dir.mkdir(parents=True, exist_ok=True)
-            tag = Path(ckpt_path).stem + (f"_{label}" if label else "")
+            tag = (Path(ckpt_path).stem if ckpt_path else label) + (f"_{label}" if label and ckpt_path else "")
 
             # Similarity histogram
             fig, ax = plt.subplots(figsize=(9, 4))
@@ -281,15 +298,18 @@ def run_evaluation(ckpt_path, rows, device, label="", out_dir=Path("eval_output"
 
 def main():
     parser = argparse.ArgumentParser()
-    parser.add_argument("--checkpoint",  required=True)
-    parser.add_argument("--checkpoint2", default=None, help="Second checkpoint to compare")
+    parser.add_argument("--checkpoint",  required=True,
+                        help="Fine-tuned checkpoint to evaluate (e.g. best_eer.pt)")
+    parser.add_argument("--checkpoint2", default=None,
+                        help="Second fine-tuned checkpoint to compare (e.g. best.pt)")
+    parser.add_argument("--baseline",    action="store_true",
+                        help="Also evaluate raw pretrained VoxCeleb weights as baseline")
     parser.add_argument("--manifest",    required=True)
     parser.add_argument("--langs",       nargs="+", default=None)
-    parser.add_argument("--max_utts",    type=int, default=1000,
+    parser.add_argument("--max_utts",    type=int, default=2000,
                         help="Max total utterances to evaluate (stratified sample)")
-    parser.add_argument("--min_utts_per_speaker", type=int, default=2,
-                        help="Min utterances per speaker (speakers below this are excluded). "
-                             "Must be >=2 for meaningful EER. Use 1 only for embedding visualisation.")
+    parser.add_argument("--min_utts_per_speaker", type=int, default=3,
+                        help="Min utterances per speaker for EER pairs")
     parser.add_argument("--out_dir",     default="eval_output")
     parser.add_argument("--no_plots",    action="store_true")
     parser.add_argument("--device",      default="cuda" if torch.cuda.is_available() else "cpu")
@@ -298,19 +318,68 @@ def main():
     random.seed(42); np.random.seed(42)
     rows = load_manifest(args.manifest, args.max_utts, args.langs,
                          min_utts_per_speaker=args.min_utts_per_speaker)
-    print(f"Loaded {len(rows)} utterances")
+    print(f"Loaded {len(rows)} utterances from "
+          f"{len(set(r['speaker_id'] for r in rows))} speakers")
 
-    r1 = run_evaluation(args.checkpoint, rows, args.device,
-                        out_dir=Path(args.out_dir), save_plots=not args.no_plots)
+    results = {}
+    out = Path(args.out_dir)
 
+    # ── Baseline (pretrained, no fine-tuning) ────────────────────────────────
+    if args.baseline:
+        model_b = load_pretrained_baseline(args.device)
+        results["pretrained_baseline"] = run_evaluation(
+            None, rows, args.device, label="pretrained_baseline",
+            out_dir=out, save_plots=not args.no_plots, model=model_b)
+
+    # ── Primary checkpoint ───────────────────────────────────────────────────
+    results["ckpt1"] = run_evaluation(
+        args.checkpoint, rows, args.device, label="",
+        out_dir=out, save_plots=not args.no_plots)
+
+    # ── Optional second checkpoint ───────────────────────────────────────────
     if args.checkpoint2:
-        r2 = run_evaluation(args.checkpoint2, rows, args.device, label="cmp2",
-                            out_dir=Path(args.out_dir), save_plots=not args.no_plots)
-        print(f"\n{'='*60}\n  Comparison\n{'='*60}")
-        print(f"  {'Metric':15s}  {'ckpt1':>10}  {'ckpt2':>10}")
-        for k in ["eer", "gap", "same_mean", "diff_mean"]:
-            print(f"  {k:15s}  {r1[k]:>10.4f}  {r2[k]:>10.4f}")
-        print(f"  → Better (lower EER): {'ckpt1' if r1['eer'] <= r2['eer'] else 'ckpt2'}")
+        results["ckpt2"] = run_evaluation(
+            args.checkpoint2, rows, args.device, label="cmp2",
+            out_dir=out, save_plots=not args.no_plots)
+
+    # ── Summary table ────────────────────────────────────────────────────────
+    if len(results) > 1:
+        print(f"\n{'='*62}")
+        print(f"  SUMMARY COMPARISON")
+        print(f"{'='*62}")
+        col_w = 14
+        header = f"  {'Metric':18s}" + "".join(f"  {k:>{col_w}}" for k in results)
+        print(header)
+        print("  " + "-" * (len(header) - 2))
+        for metric in ["eer", "gap", "same_mean", "diff_mean"]:
+            row = f"  {metric:18s}" + "".join(
+                f"  {v[metric]:>{col_w}.4f}" for v in results.values())
+            print(row)
+
+        # Training benefit assessment
+        if "pretrained_baseline" in results and "ckpt1" in results:
+            b_eer  = results["pretrained_baseline"]["eer"]
+            c1_eer = results["ckpt1"]["eer"]
+            b_gap  = results["pretrained_baseline"]["gap"]
+            c1_gap = results["ckpt1"]["gap"]
+            delta_eer = b_eer - c1_eer
+            delta_gap = c1_gap - b_gap
+            print(f"\n  Training impact vs pretrained baseline:")
+            print(f"    EER  : {b_eer:.2f}% → {c1_eer:.2f}%  "
+                  f"({'↓' if delta_eer > 0 else '↑'}{abs(delta_eer):.2f}pp "
+                  f"{'improvement ✅' if delta_eer > 1 else 'marginal' if delta_eer > 0 else 'WORSE ❌'})")
+            print(f"    Gap  : {b_gap:.4f} → {c1_gap:.4f}  "
+                  f"({'↑' if delta_gap > 0 else '↓'}{abs(delta_gap):.4f} "
+                  f"{'improvement ✅' if delta_gap > 0.02 else 'marginal' if delta_gap > 0 else 'WORSE ❌'})")
+            if delta_eer > 2 and delta_gap > 0.02:
+                print(f"\n  🟢 Fine-tuning HELPED — model is better than raw pretrained")
+            elif delta_eer > 0 or delta_gap > 0:
+                print(f"\n  🟡 Fine-tuning MARGINALLY helped — small improvement")
+            else:
+                print(f"\n  🔴 Fine-tuning DID NOT HELP — raw pretrained was better")
+                print(f"     → v3 training changes are necessary")
+        print(f"{'='*62}\n")
+
 
 if __name__ == "__main__":
     main()

@@ -106,15 +106,20 @@ class WandbLogger:
             return
         try:
             import wandb
+            import os as _os
             self.wandb = wandb
             init_kwargs = dict(
                 project=project,
                 name=run_name,
                 config=config,
-                resume="allow",   # allows resuming the same run
             )
             if run_id:
-                init_kwargs["id"] = run_id
+                # Set env var for reliability on Windows + thread start method
+                _os.environ["WANDB_RUN_ID"] = run_id
+                init_kwargs["id"]     = run_id
+                init_kwargs["resume"] = "must"   # fail loudly if run not found
+            else:
+                init_kwargs["resume"] = "allow"
             self.run = wandb.init(**init_kwargs)
             self.run_id = self.run.id
             print(f"  W&B run: {self.run.url}")
@@ -307,6 +312,7 @@ def build_checkpoint_state(
         "best_val_loss":  best_val_loss,
         "history":        history,
         "config":         vars(args),
+        "n_speakers":     model.cfg.n_speakers,   # saved top-level for reliable resume
         "wandb_run_id":   wandb_run_id,
     }
 
@@ -493,32 +499,82 @@ def train(args):
     if resume_path:
         print(f"\n  Loading checkpoint: {resume_path}")
         ckpt = load_checkpoint(resume_path)
-        model.load_state_dict(ckpt["model"])
-        optimizer.load_state_dict(ckpt["optimizer"])
-        if ckpt.get("warmup"):   warmup_sched.load_state_dict(ckpt["warmup"])
-        if ckpt.get("cosine"):   cosine_sched.load_state_dict(ckpt["cosine"])
-        start_epoch       = ckpt.get("epoch", 0) + 1
-        best_eer          = ckpt.get("best_eer", 100.0)
-        best_val_loss     = ckpt.get("best_val_loss", float("inf"))
-        history           = ckpt.get("history", [])
-        global_step       = ckpt.get("global_step", 0)
-        wandb_run_id      = ckpt.get("wandb_run_id")
-        current_phase     = ckpt.get("phase", "A")
-        # Recompute no_improve_epochs from history
-        if history and best_val_loss < float("inf"):
-            no_improve_epochs = sum(
-                1 for r in history[-args.patience:]
-                if r.get("val_loss", float("inf")) >= best_val_loss - 1e-4
-            )
-        if current_phase == "B" or start_epoch >= args.phase_b_epoch:
+
+        # ── Model weights ────────────────────────────────────────────────────
+        # Load with strict=False so AAM head size mismatch (different n_speakers)
+        # doesn't crash — backbone weights transfer, head reinitialises fresh.
+        missing, unexpected = model.load_state_dict(ckpt["model"], strict=False)
+        head_keys   = [k for k in missing + unexpected if "aam" in k.lower()]
+        other_keys  = [k for k in missing if "aam" not in k.lower()]
+        if head_keys:
+            print(f"  ℹ  AAM head keys skipped (n_speakers changed): {len(head_keys)}")
+        if other_keys:
+            print(f"  ⚠  Other missing keys: {other_keys[:5]}")
+
+        # ── Optimizer state ─────────────────────────────────────────────────
+        # CRITICAL: must detect phase and rebuild optimizer BEFORE loading
+        # state dict, because Phase B optimizer covers all params while
+        # Phase A optimizer only covers unfrozen params.
+        # n_speakers saved top-level since v2 — fall back to config for old ckpts
+        ckpt_n_spk    = ckpt.get("n_speakers") or (ckpt.get("config") or {}).get("n_speakers", -1)
+        ckpt_phase    = ckpt.get("phase", "A")
+        ckpt_epoch    = ckpt.get("epoch", 0)
+        resume_phase  = "B" if (ckpt_phase == "B" or ckpt_epoch + 1 >= args.phase_b_epoch) else "A"
+
+        if resume_phase == "B":
+            # Unfreeze model and rebuild optimizer with ALL params before loading state
             unfreeze_all(model)
             current_phase = "B"
-        print(f"  Resumed: epoch={start_epoch-1}, step={global_step}, "
-              f"phase={current_phase}, best_val_loss={best_val_loss:.4f}, "
-              f"best_EER={best_eer:.2f}%")
+            optimizer = AdamW(model.parameters(), lr=args.lr * 0.1, weight_decay=1e-2)
+            cosine_sched = CosineAnnealingLR(
+                optimizer,
+                T_max=max(1, (args.epochs - ckpt_epoch) * len(train_loader)),
+                eta_min=1e-6,
+            )
+            print(f"  ℹ  Resuming in Phase B — rebuilt optimizer with all params")
+
+        if ckpt_n_spk == n_speakers:
+            try:
+                optimizer.load_state_dict(ckpt["optimizer"])
+                if ckpt.get("warmup"): warmup_sched.load_state_dict(ckpt["warmup"])
+                if ckpt.get("cosine") and resume_phase == "B":
+                    cosine_sched.load_state_dict(ckpt["cosine"])
+                print(f"  ✅ Optimizer state restored (n_speakers={n_speakers})")
+            except Exception as e:
+                print(f"  ⚠  Optimizer restore failed ({e}) — optimizer starts fresh")
+        else:
+            print(f"  ℹ  Optimizer state skipped: checkpoint had {ckpt_n_spk} speakers, "
+                  f"current has {n_speakers}. Optimizer starts fresh.")
+
+        # ── Training state ───────────────────────────────────────────────────
+        if ckpt_n_spk == n_speakers:
+            start_epoch   = ckpt.get("epoch", 0) + 1
+            best_eer      = ckpt.get("best_eer", 100.0)
+            best_val_loss = ckpt.get("best_val_loss", float("inf"))
+            history       = ckpt.get("history", [])
+            global_step   = ckpt.get("global_step", 0)
+            wandb_run_id  = ckpt.get("wandb_run_id")
+            # current_phase already set correctly above during optimizer rebuild
+            if history and best_val_loss < float("inf"):
+                # Count consecutive epochs from the END of history where
+                # EER did not improve — this is what the training loop tracks.
+                no_improve_epochs = 0
+                for r in reversed(history):
+                    if r.get("val_eer", 100.0) <= best_eer + 0.01:
+                        break   # found an improvement, stop counting
+                    no_improve_epochs += 1
+                no_improve_epochs = min(no_improve_epochs, args.patience - 1)  # don't fire immediately on resume
+                print(f"  Patience counter restored: {no_improve_epochs}/{args.patience}")
+            print(f"  Resumed: epoch={start_epoch-1}, step={global_step}, "
+                  f"phase={current_phase}, best_val_loss={best_val_loss:.4f}, "
+                  f"best_EER={best_eer:.2f}%")
+        else:
+            print(f"  Starting from epoch 1 with restored backbone weights.")
 
     # ── W&B ─────────────────────────────────────────────────────────────────
     run_name = args.wandb_run_name or f"speaker-enc-{time.strftime('%m%d-%H%M')}"
+    if wandb_run_id:
+        print(f"  W&B resuming run: {wandb_run_id}")
     logger = WandbLogger(
         enabled  = args.wandb,
         project  = args.wandb_project,
@@ -682,13 +738,13 @@ def train(args):
             save_checkpoint(state, str(ckpt_dir / "best_eer.pt"))
             print(f"  ✨ New best EER: {best_eer:.2f}%  → saved best_eer.pt")
 
-        # Early stopping on val_loss (patience=5 epochs without improvement)
-        if val_loss < best_val_loss + 1e-4:
+        # Early stopping on EER (more meaningful than val_loss at this stage)
+        if eer < best_eer + 0.01:   # improved or within noise floor
             no_improve_epochs = 0
         else:
             no_improve_epochs += 1
         if no_improve_epochs >= args.patience:
-            print(f"  ⏹  Val loss no improvement for {args.patience} epochs. Stopping.")
+            print(f"  ⏹  EER no improvement for {args.patience} epochs. Stopping.")
             break
 
         # EER target (secondary early stop)
@@ -758,7 +814,7 @@ def main():
     g.add_argument("--val_batch_size",     type=int,   default=64)
     g.add_argument("--target_eer",         type=float, default=5.0,
                    help="Secondary early stop when val EER drops below this (%)")
-    g.add_argument("--patience",           type=int,   default=8,
+    g.add_argument("--patience",           type=int,   default=12,
                    help="Stop if val_loss does not improve for this many epochs")
     g.add_argument("--device",             default="cuda" if torch.cuda.is_available() else "cpu")
 
